@@ -1268,18 +1268,23 @@ func TestCheckFailureInvalidPropertyRecord(t *testing.T) {
 			SkipPreview:   true,
 			Validate: func(project workspace.Project, target deploy.Target, j *Journal, evts []Event, err error) error {
 				sawFailure := false
+				sawBadMessage := false
 				for _, evt := range evts {
 					if evt.Type == DiagEvent {
 						e := evt.Payload.(DiagEventPayload)
 						msg := colors.Never.Colorize(e.Message)
-						sawFailure = strings.Contains(msg, "field is not valid") && e.Severity == diag.Error
-						if sawFailure {
-							break
+						if !sawFailure {
+							sawFailure = strings.Contains(msg, "field is not valid") && e.Severity == diag.Error
+						}
+
+						if !sawBadMessage {
+							sawBadMessage = strings.Contains(msg, "One or more resource validation errors occurred")
 						}
 					}
 				}
 
 				assert.True(t, sawFailure)
+				assert.False(t, sawBadMessage)
 				return err
 			},
 		}},

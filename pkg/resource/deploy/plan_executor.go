@@ -36,9 +36,6 @@ type planExecutor struct {
 	stepExec *stepExecutor  // step executor owned by this plan
 }
 
-// Utility for convenient logging.
-var log = logging.V(4)
-
 // execError creates an error appropriate for returning from planExecutor.Execute.
 func execError(message string, preview bool) error {
 	kind := "update"
@@ -65,7 +62,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 		case <-callerCtx.Done():
 			cancelErr := pe.plan.ctx.Host.SignalCancellation()
 			if cancelErr != nil {
-				log.Infof("planExecutor.Execute(...): failed to signal cancellation to providers: %v", cancelErr)
+				logging.V(4).Infof("planExecutor.Execute(...): failed to signal cancellation to providers: %v", cancelErr)
 			}
 		case <-done:
 		}
@@ -111,7 +108,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 					return
 				}
 			case <-done:
-				log.Infof("planExecutor.Execute(...): incoming events goroutine exiting")
+				logging.V(4).Infof("planExecutor.Execute(...): incoming events goroutine exiting")
 				return
 			}
 		}
@@ -126,11 +123,11 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 	//  3. The stepExecCancel cancel context gets canceled. This means some error occurred in the step executor
 	//     and we need to bail. This can also happen if the user hits Ctrl-C.
 	canceled, err := func() (bool, error) {
-		log.Infof("planExecutor.Execute(...): waiting for incoming events")
+		logging.V(4).Infof("planExecutor.Execute(...): waiting for incoming events")
 		for {
 			select {
 			case event := <-incomingEvents:
-				log.Infof("planExecutor.Execute(...): incoming event (nil? %v, %v)", event.Event == nil, event.Error)
+				logging.V(4).Infof("planExecutor.Execute(...): incoming event (nil? %v, %v)", event.Event == nil, event.Error)
 
 				if event.Error != nil {
 					pe.reportError("", event.Error)
@@ -148,19 +145,35 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 					// Signal completion to the step executor. It'll exit once it's done retiring all of the steps in
 					// the chain that we just gave it.
 					pe.stepExec.SignalCompletion()
-					log.Infof("planExecutor.Execute(...): issued deletes")
+					logging.V(4).Infof("planExecutor.Execute(...): issued deletes")
 
 					return false, nil
 				}
 
-				if eventErr := pe.handleSingleEvent(event.Event); eventErr != nil {
-					log.Infof("planExecutor.Execute(...): error handling event: %v", eventErr)
-					pe.reportError(pe.plan.generateEventURN(event.Event), eventErr)
+				flow, eventErr := pe.handleSingleEvent(event.Event)
+				if eventErr != nil || flow == Bail {
+					if eventErr != nil {
+						logging.V(4).Infof("planExecutor.Execute(...): error handling event: %v", eventErr)
+						pe.reportError(pe.plan.generateEventURN(event.Event), eventErr)
+					}
+
+					logging.V(4).Infof("planExecutor.Execute(...): canceling context")
 					cancel()
+
+					// TODO(swgillespie) - As we plumb new error handling code throughout the engine, we will
+					// be able to propegate the `Bail` upwards to our callers so that we don't need to fabricate
+					// fake errors here to force the process to tear down.
+					//
+					// For now, creating a bogus error is sufficient to cause this function to emit a "plan faliled"
+					// error that ultimately bubbles up to the top level.
+					if eventErr == nil {
+						eventErr = errors.New("step generation failed")
+					}
 					return false, eventErr
 				}
+
 			case <-ctx.Done():
-				log.Infof("planExecutor.Execute(...): context finished: %v", ctx.Err())
+				logging.V(4).Infof("planExecutor.Execute(...): context finished: %v", ctx.Err())
 
 				// NOTE: we use the presence of an error in the caller context in order to distinguish caller-initiated
 				// cancellation from internally-initiated cancellation.
@@ -171,7 +184,7 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 	close(done)
 
 	pe.stepExec.WaitForCompletion()
-	log.Infof("planExecutor.Execute(...): step executor has completed")
+	logging.V(4).Infof("planExecutor.Execute(...): step executor has completed")
 
 	// Figure out if execution failed and why. Step generation and execution errors trump cancellation.
 	if err != nil || pe.stepExec.Errored() {
@@ -184,29 +197,35 @@ func (pe *planExecutor) Execute(callerCtx context.Context, opts Options, preview
 
 // handleSingleEvent handles a single source event. For all incoming events, it produces a chain that needs
 // to be executed and schedules the chain for execution.
-func (pe *planExecutor) handleSingleEvent(event SourceEvent) error {
+func (pe *planExecutor) handleSingleEvent(event SourceEvent) (controlFlow, error) {
 	contract.Require(event != nil, "event != nil")
 
 	var steps []Step
+	var flow controlFlow
 	var err error
 	switch e := event.(type) {
 	case RegisterResourceEvent:
-		log.Infof("planExecutor.handleSingleEvent(...): received RegisterResourceEvent")
-		steps, err = pe.stepGen.GenerateSteps(e)
+		logging.V(4).Infof("planExecutor.handleSingleEvent(...): received RegisterResourceEvent")
+		steps, flow, err = pe.stepGen.GenerateSteps(e)
 	case ReadResourceEvent:
-		log.Infof("planExecutor.handleSingleEvent(...): received ReadResourceEvent")
-		steps, err = pe.stepGen.GenerateReadSteps(e)
+		logging.V(4).Infof("planExecutor.handleSingleEvent(...): received ReadResourceEvent")
+		steps, flow, err = pe.stepGen.GenerateReadSteps(e)
 	case RegisterResourceOutputsEvent:
-		log.Infof("planExecutor.handleSingleEvent(...): received register resource outputs")
+		logging.V(4).Infof("planExecutor.handleSingleEvent(...): received register resource outputs")
 		pe.stepExec.ExecuteRegisterResourceOutputs(e)
-		return nil
+		return Continue, nil
 	}
 
+	logging.V(4).Infof("planExecutor.handleSingleEvent(...): generated steps, err=%s, status=%d", err, flow)
 	if err != nil {
-		return err
+		return flow, err
 	}
-	pe.stepExec.Execute(steps)
-	return nil
+
+	if flow != Bail {
+		pe.stepExec.Execute(steps)
+	}
+
+	return flow, nil
 }
 
 // refresh refreshes the state of the base checkpoint file for the current plan in memory.
