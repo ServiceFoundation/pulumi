@@ -405,7 +405,7 @@ func (sg *stepGenerator) GenerateSteps(event RegisterResourceEvent) ([]Step, con
 		// step to attempt to "continue" awaiting initialization.
 		if len(old.InitErrors) > 0 {
 			sg.updates[urn] = true
-			return []Step{NewUpdateStep(sg.plan, event, old, new, diff.StableKeys)}, nil
+			return []Step{NewUpdateStep(sg.plan, event, old, new, diff.StableKeys)}, Continue, nil
 		}
 
 		// No need to update anything, the properties didn't change.
